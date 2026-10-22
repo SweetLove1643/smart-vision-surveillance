@@ -1,0 +1,12 @@
+[
+  {"name": "CAM 1", "source": "resources/videos/C001.mp4"},
+  {"name": "CAM 2", "source": "resources/videos/C002.mp4"},
+  {"name": "CAM 3", "source": "resources/videos/C003.mp4"},
+  {"name": "CAM 4", "source": "resources/videos/C004.mp4"},
+  {"name": "CAM 5", "source": "resources/videos/C005.mp4"},
+  {"name": "CAM 6", "source": "resources/videos/C006.mp4"},
+  {"name": "CAM 7", "source": "resources/videos/C007.mp4"},
+  {"name": "CAM 8", "source": "resources/videos/C008.mp4"},
+  {"name": "CAM 9", "source": "resources/videos/C009.mp4"},
+  {"name": "CAM 10", "source": "resources/videos/C010.mp4"}
+]
