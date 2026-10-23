@@ -41,6 +41,10 @@ main_app/logs/
 *.sqlite
 *.sqlite3
 *.db
+resources/database/*.db
+resources/database/snapshots/*
+!resources/database/.gitkeep
+!resources/database/snapshots/.gitkeep
 
 # Media files & test videos (>100MB exceed GitHub's upload limits)
 resources/videos/*
@@ -50,58 +54,27 @@ resources/videos/*
 *.mkv
 *.mov
 
-# Snapshots, event frames, and output dumps
-snapshots/
-captured_frames/
-output/
-
 # Machine learning model weights
 *.pt
 *.pth
 *.onnx
 *.engine
 weights/
-models/*.pt
-
-# PyInstaller / packaging
-*.manifest
-*.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+resources/models/*
+!resources/models/.gitkeep
 
 # Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
 .pytest_cache/
-cover/
+.coverage
+htmlcov/
 
 # IDE & Editor settings
 .vscode/
 .idea/
 *.swp
 *.swo
-*~
-.project
-.pydevproject
-.settings/
 
 # Operating System files
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
 desktop.ini

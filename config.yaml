@@ -1,0 +1,94 @@
+server:
+  host: "0.0.0.0"
+  port: 8000
+
+model:
+  # Hỗ trợ OpenVINO folder, PyTorch (.pt), hoặc ONNX (.onnx)
+  weights: "resources/models/yolov8n_openvino_model"
+  conf: 0.35
+  iou: 0.45
+  imgsz: 320         # 320x320 tối ưu CPU cực tốt (~25-30 FPS/luồng)
+  skip_frames: 1     # Infer AI 1 frame rồi giữ box frame tiếp theo -> giảm 50% CPU mà hình ảnh vẫn mượt
+  target_fps: 15     # Giới hạn xử lý tối đa mỗi camera (đáp ứng tiêu chí >= 10 FPS, trễ < 1s)
+  classes:
+    - 0  # person
+    - 1  # bicycle
+    - 2  # car
+    - 3  # motorcycle
+    - 5  # bus
+    - 7  # truck
+  device: "cpu"
+
+database:
+  path: "resources/database/events.db"
+  snapshot_dir: "resources/database/snapshots"
+
+cameras:
+  - id: "cam_1"
+    name: "Camera 1 - Front Gate"
+    source: "resources/videos/C001.mp4"
+    rtsp_out: "rtsp://localhost:8554/live/cam_1"
+    enabled: true
+    line_crossing:
+      enabled: true
+      point1: [420, 750]
+      point2: [1950, 750]
+    restricted_zone:
+      enabled: true
+      polygon:
+        - [420, 650]
+        - [1950, 650]
+        - [1950, 850]
+        - [420, 850]
+
+
+  - id: "cam_2"
+    name: "Camera 2 - Parking Lot"
+    source: "resources/videos/C002.mp4"
+    rtsp_out: "rtsp://localhost:8554/live/cam_2"
+    enabled: true
+    line_crossing:
+      enabled: true
+      point1: [420, 750]
+      point2: [1950, 750]
+    restricted_zone:
+      enabled: true
+      polygon:
+        - [420, 650]
+        - [1950, 650]
+        - [1950, 850]
+        - [420, 850]
+
+  - id: "cam_3"
+    name: "Camera 3 - Side Alley"
+    source: "resources/videos/C003.mp4"
+    rtsp_out: "rtsp://localhost:8554/live/cam_3"
+    enabled: true
+    line_crossing:
+      enabled: true
+      point1: [420, 750]
+      point2: [1950, 750]
+    restricted_zone:
+      enabled: true
+      polygon:
+        - [420, 650]
+        - [1950, 650]
+        - [1950, 850]
+        - [420, 850]
+
+  - id: "cam_4"
+    name: "Camera 4 - Backyard"
+    source: "resources/videos/C004.mp4"
+    rtsp_out: "rtsp://localhost:8554/live/cam_4"
+    enabled: true
+    line_crossing:
+      enabled: true
+      point1: [420, 750]
+      point2: [1950, 750]
+    restricted_zone:
+      enabled: true
+      polygon:
+        - [420, 650]
+        - [1950, 650]
+        - [1950, 850]
+        - [420, 850]

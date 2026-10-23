@@ -1,65 +1,39 @@
 # Multi-Camera Real-Time Video Processing System
 
-> **Status: Work in Progress (WIP)**  
-> An intelligent, scalable multi-camera processing and analytics pipeline built in Python, designed to handle concurrent video streams with low latency, robust auto-reconnection, and edge AI vision tasks.
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-009688.svg)](https://fastapi.tiangolo.com/)
+[![PySide6](https://img.shields.io/badge/PySide6-Qt6-41CD52.svg)](https://wiki.qt.io/Qt_for_Python)
+[![YOLOv8](https://img.shields.io/badge/YOLO-v8-yellowgreen.svg)](https://github.com/ultralytics/ultralytics)
+
+A real-time, fault-tolerant multi-camera video processing and analytics service in Python. Ingests concurrent video streams (RTSP, webcams, and local video files), runs YOLOv8 object detection & tracking (person & vehicle), performs event analytics (bidirectional line crossing counter & restricted zone intrusion alert), saves events and violation snapshots to SQLite, restreams annotated feeds via FFmpeg/RTSP, and provides both a REST API (FastAPI) and an on-demand Qt6 desktop monitoring dashboard.
 
 ---
 
-## 📌 Project Overview
+## 🏛️ System Architecture
 
-This project is a high-performance Python application designed to ingest and process multiple video sources simultaneously (RTSP camera streams, webcams, and pre-recorded video files). Built for video surveillance and intelligent analytics, the system isolates failures per camera stream, guarantees real-time frame processing by eliminating buffer lag, and provides an interactive monitoring GUI.
-
-### Core Processing Pipeline
-
+```text
+[ Video Sources ] (RTSP / Webcam / Local Video Files)
+       │
+       ▼
+ [ CaptureService ] ───── (Threaded, exponential backoff auto-reconnect, zero-latency buffer)
+       │
+       ▼
+ [ DetectorService ] ──── (YOLOv8 object detection & persistent multi-object tracking)
+       │
+       ▼
+[ AnalyticsService ] ────┬──> [ StorageService ] ──> SQLite DB & Snapshots (`resources/database/`)
+                         └──> [ LoggingService ] ──> Centralized file log (`logs/app.log`)
+       │
+       ▼
+ [ StreamerService ] ────> FFmpeg RTSP Re-streaming (Auto-restart on exit)
+       │
+       ├─────────────────────────────────┐
+       ▼                                 ▼
+[ FastAPI Server ] (Port 8000)    [ PySide6 UI Monitor ] (On-demand with `--ui`)
+├─ Web Swagger UI (`/docs`)       └─ Live grid view with real-time counters & alerts
+├─ Direct MJPEG live stream
+└─ REST endpoints (F10)
 ```
-[ Camera / RTSP / Video ]
-           │
-           ▼
-    [ Video Capture ] ──── (Auto-reconnect & Drop-frame buffer)
-           │
-           ▼
-  [ Detect & Track ] ──── (YOLOv8 + Object Tracking)
-           │
-           ▼
-  [ Event Processing ] ──┬──> [ Event Database (SQLite) & Snapshots ]
-           │             └──> [ Rotating File Logger ]
-           ▼
-    [ Visual Overlay ]
-           │
-           ▼
- [ FFmpeg / RTSP Out ] ───> Live Stream (VLC / Client)
-```
-
----
-
-## 🚀 Key Features & Roadmap
-
-The project is built against strict real-time multi-camera processing specifications:
-
-| Code | Feature Description | Status |
-| :---: | :--- | :---: |
-| **F01** | Multi-source ingestion (RTSP, webcam, files) with automatic reconnect and fault isolation (one failed stream will not crash others) | **Implemented** |
-| **F02** | Zero-latency buffer strategy: always process the freshest frame, dropping queued frames to prevent lag accumulation | **Implemented** |
-| **F03** | Person & Vehicle detection using YOLO (v8+) with dynamic thresholds and input size | *In Progress* |
-| **F04** | Real-time multi-object tracking (MOT) | *In Progress* |
-| **F05** | Bidirectional line crossing counter (inbound / outbound separated) | *Planned* |
-| **F06** | Restricted area / ROI intrusion detection (arbitrary polygons) | *Planned* |
-| **F07** | Deduplicated event recording (Camera, Track ID, Event Type, Timestamp, Snapshot image) into SQLite | *Planned* |
-| **F08** | Frame annotations (bounding boxes, IDs, counters, polygons) and FFmpeg RTSP restreaming with auto-recovery | *Planned* |
-| **F09** | Configuration management via YAML/JSON with startup validation | **Implemented** |
-| **F10** | FastAPI management service: stream status, FPS metrics, live stream toggle, and event query endpoints | *Planned* |
-
----
-
-## 🛠️ Architecture & Tech Stack
-
-- **Language:** Python 3.10+
-- **GUI Framework:** PySide6 (Qt for Python) with dark theme and dynamic grid layout (up to 16 cameras).
-- **Computer Vision:** OpenCV (cv2) with TCP-forced RTSP transport for packet drop resistance.
-- **AI & Analytics (Targeted):** Ultralytics YOLOv8 / ByteTrack / BoT-SORT.
-- **Streaming & Transcoding:** FFmpeg for RTSP rebroadcasting.
-- **Backend & Storage:** FastAPI, SQLite, Pydantic.
-- **Testing & Tooling:** Pytest, Python `logging` with rotating file handlers.
 
 ---
 
@@ -67,92 +41,91 @@ The project is built against strict real-time multi-camera processing specificat
 
 ```text
 multi_camera_process_system/
+├── config.yaml                    # Centralized system YAML configuration (F09)
+├── main.py                        # Entrypoint (Service mode / UI mode with --ui)
+├── requirements.txt               # Dependencies
+├── README.md                      # Documentation
+├── .gitignore                     # Git ignore rules
+│
 ├── main_app/
 │   ├── controllers/
-│   │   └── camera_controller.py   # Multi-camera orchestration & lifecycle manager
+│   │   ├── camera_controller.py   # Multi-camera pipeline lifecycle manager
+│   │   └── api_controller.py      # FastAPI REST API controller & MJPEG streamer (F10)
 │   ├── services/
-│   │   ├── capture.py             # Threaded frame reader with exponential backoff reconnect
-│   │   └── logging_setup.py       # Rotating log handlers and exception hooks
-│   ├── ui/
-│   │   ├── cameras.json           # Active camera stream configuration
-│   │   ├── ui_config.json         # Interface layout configuration
-│   │   └── main_window.py         # PySide6 desktop monitoring dashboard
-│   └── logs/                      # Application runtime logs
+│   │   ├── config_service.py      # Pydantic schema validation for config.yaml (F09)
+│   │   ├── capture_service.py     # Threaded capture, auto-reconnect & drop-frame (F01, F02)
+│   │   ├── detector_service.py    # YOLOv8 object detection & MOT tracking (F03, F04)
+│   │   ├── analytics_service.py   # Line crossing & zone intrusion analyzers (F05, F06)
+│   │   ├── storage_service.py     # SQLite persistence & snapshots manager (F07)
+│   │   ├── streamer_service.py    # FFmpeg RTSP streamer with auto-recovery (F08)
+│   │   └── logging_service.py     # Centralized logging into logs/app.log
+│   └── ui/
+│       └── main_window.py         # PySide6 desktop monitoring dashboard
+│
 ├── resources/
-│   └── videos/                    # Sample video feeds (.gitkeep preserved)
-├── tests/                         # Unit tests (line crossing, ROI intrusion)
-├── Description.pdf                # Detailed project requirements & assignment brief
-├── main.py                        # Application entrypoint
-├── requirements.txt               # Project dependencies
-└── README.md
+│   ├── database/                  # SQLite database (events.db) & violation snapshots
+│   ├── models/                    # YOLO model weights (yolov8n.pt)
+│   └── videos/                    # Sample test video feeds (.gitkeep preserved)
+│
+├── logs/                          # Centralized runtime application logs (app.log)
+└── tests/
+    └── test_analytics.py          # Pytest unit tests for line counter & zone intrusion
 ```
 
 ---
 
 ## ⚡ Getting Started
 
-### 1. Prerequisites
+### 1. Installation
 
-- Python 3.10 or higher
-- Git
-- (Optional) FFmpeg installed and added to your system PATH
-
-### 2. Installation
-
-Clone the repository:
 ```bash
-git clone https://github.com/<your-username>/multi_camera_process_system.git
-cd multi_camera_process_system
-```
+# Clone the repository
+git clone https://github.com/<your-username>/multi-camera-processing-system.git
+cd multi-camera-processing-system
 
-Create and activate a virtual environment:
-```bash
-# Windows
+# Create and activate a virtual environment
 python -m venv .venv
-.venv\Scripts\activate
+.venv\Scripts\activate          # Windows
+source .venv/bin/activate       # Linux/macOS
 
-# Linux / macOS
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-Install dependencies:
-```bash
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-### 3. Configuration
+### 2. Run Unit Tests
 
-Camera sources are defined in [main_app/ui/cameras.json](file:///main_app/ui/cameras.json):
-```json
-[
-  {"name": "CAM 1", "source": "resources/videos/C001.mp4"},
-  {"name": "CAM 2", "source": "rtsp://admin:password@192.168.1.100:554/stream"},
-  {"name": "CAM 3", "source": 0}
-]
+```bash
+pytest -v
 ```
-- **Webcam:** Set `source` to an integer index (e.g. `0`).
-- **RTSP:** Set `source` to the RTSP URL (e.g. `rtsp://...`).
-- **Video File:** Set `source` to the local file path (files automatically loop when finished).
 
-### 4. Running the Application
+### 3. Launch the Application
 
-Launch the desktop monitoring interface:
+#### Option A: Run as a Backend Service (Standard)
 ```bash
 python main.py
 ```
+- **API & Swagger UI:** Open [http://localhost:8000/docs](http://localhost:8000/docs)
+- **Watch Live Camera directly in Browser (MJPEG):** Open [http://localhost:8000/cameras/cam_1/live](http://localhost:8000/cameras/cam_1/live)
+
+#### Option B: Run Service with PySide6 (Qt6) Monitoring GUI
+```bash
+python main.py --ui
+```
+This starts the backend API service and simultaneously opens the desktop monitoring window showing real-time camera feeds, bounding boxes, counting lines, ROI polygons, and event tables.
 
 ---
 
-## 🎯 Non-Functional Requirements & Targets
+## 📡 REST API Endpoints (F10)
 
-- **Performance:** Maintain $\ge 10\text{ FPS}$ output per camera across 4 concurrent streams with end-to-end latency $< 1\text{ second}$.
-- **Clean Teardown:** Graceful shutdown of threads, subprocesses, and connections upon `Ctrl+C` or application exit.
-- **Production Logging:** Mask sensitive credentials in RTSP URLs and record reconnect metrics, FPS, and exceptions to rotating logs (`logs/app.log`).
-- **Containerization:** Complete Docker / Docker Compose setup for deployment.
+- `GET /health` : Health check and camera count.
+- `GET /cameras` : Live status, FPS, latency, and reconnect count for all cameras.
+- `POST /cameras/{camera_id}/start` : Start a camera pipeline dynamically.
+- `POST /cameras/{camera_id}/stop` : Stop a camera pipeline dynamically.
+- `GET /events` : Query violation events (filters: `camera_id`, `start_time`, `end_time`, `limit`).
+- `GET /cameras/{camera_id}/live` : Live video stream viewable directly in any browser.
+- `GET /snapshots/{filename}` : Access captured violation snapshot images.
 
 ---
 
 ## 📄 License
-
-This project is licensed under the [MIT License](LICENSE) (or academic project license).
+This project is licensed under the MIT License.

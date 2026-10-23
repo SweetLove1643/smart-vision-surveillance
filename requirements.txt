@@ -1,19 +1,23 @@
-# Core & GUI
-PySide6>=6.5.0
-opencv-python>=4.8.0
+# Core & Computer Vision
 numpy>=1.24.0
+opencv-python>=4.8.0
+ultralytics>=8.0.0
+torch>=2.0.0
+torchvision>=0.15.0
+
+# CPU Acceleration (OpenVINO / ONNX)
+openvino>=2024.0.0
+
+# API & Web Server
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+
+# GUI
+PySide6>=6.5.0
 
 # Configuration & Data Validation
 PyYAML>=6.0
 pydantic>=2.0.0
 
-# Detection & Tracking (Upcoming / In Progress)
-# ultralytics>=8.0.0
-# lapx>=0.5.5
-
-# Web API & Server (Upcoming / In Progress)
-# fastapi>=0.100.0
-# uvicorn>=0.23.0
-
-# Testing & Dev
+# Testing
 pytest>=7.0.0
