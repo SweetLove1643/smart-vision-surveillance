@@ -1,9 +1,10 @@
 from datetime import datetime
+from contextlib import contextmanager
 import logging
 from pathlib import Path
 import sqlite3
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 import cv2
 import numpy as np
 
@@ -27,10 +28,15 @@ class EventDatabase:
 
         self._init_db()
 
-    def _get_connection(self) -> sqlite3.Connection:
+    @contextmanager
+    def _get_connection(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         with self._lock, self._get_connection() as conn:
@@ -45,6 +51,27 @@ class EventDatabase:
                     snapshot_path TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS camera_counts (
+                    camera_id TEXT PRIMARY KEY,
+                    count_in INTEGER NOT NULL DEFAULT 0,
+                    count_out INTEGER NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO camera_counts (camera_id, count_in, count_out)
+                SELECT camera_id,
+                       SUM(CASE WHEN details LIKE '%Direction: in%' THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN details LIKE '%Direction: out%' THEN 1 ELSE 0 END)
+                FROM events
+                WHERE event_type = 'line_crossing'
+                GROUP BY camera_id
                 """
             )
             conn.commit()
@@ -87,6 +114,83 @@ class EventDatabase:
             snapshot_rel_path,
         )
         return event_id
+
+    def save_line_crossing(
+        self,
+        camera_id: str,
+        track_id: int,
+        direction: str,
+        details: str = "",
+        frame: Optional[np.ndarray] = None,
+    ) -> Tuple[int, int, int]:
+        if direction not in {"in", "out"}:
+            raise ValueError(f"Hướng đếm không hợp lệ: {direction}")
+
+        now_str = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        snapshot_rel_path = ""
+        if frame is not None:
+            filename = f"{camera_id}_t{track_id}_{now_str}.jpg"
+            snapshot_full_path = self.snapshot_dir / filename
+            cv2.imwrite(str(snapshot_full_path), frame)
+            snapshot_rel_path = str(snapshot_full_path)
+
+        increment_in = int(direction == "in")
+        increment_out = int(direction == "out")
+        with self._lock, self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO events (camera_id, track_id, event_type, details, snapshot_path, created_at)
+                VALUES (?, ?, 'line_crossing', ?, ?, datetime('now', 'localtime'))
+                """,
+                (camera_id, track_id, details, snapshot_rel_path),
+            )
+            conn.execute(
+                """
+                INSERT INTO camera_counts (camera_id, count_in, count_out)
+                VALUES (?, ?, ?)
+                ON CONFLICT(camera_id) DO UPDATE SET
+                    count_in = count_in + excluded.count_in,
+                    count_out = count_out + excluded.count_out,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (camera_id, increment_in, increment_out),
+            )
+            counts = conn.execute(
+                "SELECT count_in, count_out FROM camera_counts WHERE camera_id = ?",
+                (camera_id,),
+            ).fetchone()
+            event_id = int(cursor.lastrowid)
+
+        logger.info(
+            "[%s] Ghi sự kiện #%s: line_crossing (%s, Track: %s, Count: %s/%s)",
+            camera_id,
+            event_id,
+            direction,
+            track_id,
+            counts["count_in"],
+            counts["count_out"],
+        )
+        return event_id, int(counts["count_in"]), int(counts["count_out"])
+
+    def get_counts(self) -> Dict[str, Dict[str, int]]:
+        with self._lock, self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT camera_id, count_in, count_out FROM camera_counts"
+            ).fetchall()
+            return {
+                row["camera_id"]: {
+                    "count_in": int(row["count_in"]),
+                    "count_out": int(row["count_out"]),
+                }
+                for row in rows
+            }
+
+    def ensure_camera(self, camera_id: str) -> None:
+        with self._lock, self._get_connection() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO camera_counts (camera_id) VALUES (?)",
+                (camera_id,),
+            )
 
     def get_events(
         self,

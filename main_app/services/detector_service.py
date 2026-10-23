@@ -1,11 +1,11 @@
 from dataclasses import dataclass
 import logging
-import os
 from pathlib import Path
 from typing import List, Optional, Tuple
 import numpy as np
 import torch
 from ultralytics import YOLO
+import yaml
 
 logger = logging.getLogger("services.detector")
 
@@ -26,18 +26,15 @@ class Detection:
 class YoloTracker:
     """Nhận diện & bám vết đối tượng đa luồng dùng YOLOv8 (F03, F04).
     
-    Hỗ trợ:
-    - Model gốc PyTorch (.pt)
-    - Model OpenVINO (folder `resources/models/yolov8n_openvino_model`) tối ưu CPU
-    - Model ONNX (.onnx)
+    Model .pt/.onnx được tự động export và dùng dưới dạng OpenVINO trên CPU.
     """
 
     def __init__(
         self,
-        weights: str = "resources/models/yolov8n_openvino_model",
-        conf: float = 0.35,
+        weights: str = "resources/models/yolov8s_openvino_model",
+        conf: float = 0.25,
         iou: float = 0.45,
-        imgsz: int = 320,
+        imgsz: int = 480,
         classes: Optional[List[int]] = None,
         device: str = "cpu",
     ) -> None:
@@ -48,38 +45,99 @@ class YoloTracker:
         self.device = device
 
         resolved_weights = self._resolve_model_weights(weights)
-        logger.info("Khởi tạo YOLO tracker với: %s (imgsz=%d, device=%s)", resolved_weights, imgsz, device)
+        logger.info(
+            "Khởi tạo YOLO tracker với: %s (imgsz=%d, device=%s)",
+            resolved_weights,
+            imgsz,
+            device,
+        )
         self.model = YOLO(resolved_weights)
 
     def _resolve_model_weights(self, weights: str) -> str:
-        """Kiểm tra và tự động chuyển đổi sang OpenVINO nếu cần."""
-        path = Path(weights)
+        """Resolve an explicit OpenVINO model or export a source model for CPU use."""
+        path = Path(weights).expanduser()
+        if path.is_dir():
+            if self._openvino_imgsz_matches(path):
+                logger.info("Sử dụng model OpenVINO có sẵn: %s", path)
+                return str(path)
+            if not path.name.lower().endswith("_openvino_model"):
+                raise ValueError(f"Thư mục model OpenVINO không hợp lệ: {path}")
 
-        # 1. Nếu đường dẫn chỉ định đã tồn tại (folder OpenVINO hoặc file .pt / .onnx)
-        if path.exists():
-            return str(path)
+        if path.suffix.lower() in {".pt", ".onnx"}:
+            source_path = path if path.is_file() else None
+            openvino_dir = path.parent / f"{path.stem}_openvino_model"
+        elif path.name.lower().endswith("_openvino_model"):
+            openvino_dir = path
+            source_stem = path.name[: -len("_openvino_model")]
+            source_path = next(
+                (
+                    candidate
+                    for candidate in (
+                        path.with_name(f"{source_stem}.pt"),
+                        path.with_name(f"{source_stem}.onnx"),
+                    )
+                    if candidate.is_file()
+                ),
+                None,
+            )
+        else:
+            raise FileNotFoundError(
+                f"Không tìm thấy model '{weights}'. Hãy chỉ định file .pt/.onnx "
+                "hoặc thư mục OpenVINO hợp lệ."
+            )
 
-        # 2. Nếu đang chỉ định OpenVINO nhưng chưa có, thử tìm .pt để convert
-        pt_path = Path("resources/models/yolov8n.pt")
-        if not pt_path.exists():
-            pt_path = Path("yolov8n.pt")
+        if openvino_dir.is_dir() and self._openvino_imgsz_matches(openvino_dir):
+            logger.info("Sử dụng model OpenVINO đã convert: %s", openvino_dir)
+            return str(openvino_dir)
 
-        if pt_path.exists() and "openvino" in weights.lower():
-            logger.info("Chưa có OpenVINO model, đang tự động export từ: %s ...", pt_path)
-            try:
-                base_model = YOLO(str(pt_path))
-                exported_dir = base_model.export(format="openvino", imgsz=self.imgsz, half=True)
-                logger.info("Export OpenVINO thành công: %s", exported_dir)
-                return str(exported_dir)
-            except Exception as exc:
-                logger.warning("Không thể export sang OpenVINO (%s), dùng tạm file .pt gốc.", exc)
-                return str(pt_path)
+        if source_path is None:
+            raise FileNotFoundError(
+                f"Không tìm thấy model nguồn '{path}' hoặc OpenVINO model phù hợp "
+                f"cho imgsz={self.imgsz}."
+            )
 
-        # 3. Fallback về .pt
-        if pt_path.exists():
-            return str(pt_path)
+        logger.info(
+            "Đang export %s sang OpenVINO (imgsz=%d, FP16)...",
+            source_path,
+            self.imgsz,
+        )
+        try:
+            exported_dir = YOLO(str(source_path)).export(
+                format="openvino", imgsz=self.imgsz, half=True
+            )
+            exported_path = Path(exported_dir)
+            if not exported_path.is_dir():
+                raise RuntimeError(f"Exporter không tạo thư mục OpenVINO: {exported_dir}")
+            logger.info("Export OpenVINO thành công: %s", exported_path)
+            return str(exported_path)
+        except Exception as exc:
+            logger.warning(
+                "Export OpenVINO thất bại cho %s: %s. "
+                "Đang fallback sang model nguồn; inference sẽ không chạy bằng OpenVINO.",
+                source_path,
+                exc,
+            )
+            return str(source_path)
 
-        return weights
+    def _openvino_imgsz_matches(self, model_dir: Path) -> bool:
+        metadata_path = model_dir / "metadata.yaml"
+        if not metadata_path.is_file():
+            return False
+        try:
+            with metadata_path.open("r", encoding="utf-8") as metadata_file:
+                metadata = yaml.safe_load(metadata_file) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            logger.warning("Không đọc được metadata OpenVINO %s: %s", metadata_path, exc)
+            return False
+
+        exported_imgsz = metadata.get("imgsz")
+        if isinstance(exported_imgsz, int):
+            return exported_imgsz == self.imgsz
+        if isinstance(exported_imgsz, (list, tuple)):
+            return bool(exported_imgsz) and all(
+                size == self.imgsz for size in exported_imgsz
+            )
+        return False
 
     def track(self, frame: np.ndarray) -> List[Detection]:
         results = self.model.track(

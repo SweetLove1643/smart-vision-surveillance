@@ -3,13 +3,14 @@ server:
   port: 8000
 
 model:
-  # Hỗ trợ OpenVINO folder, PyTorch (.pt), hoặc ONNX (.onnx)
-  weights: "resources/models/yolov8n_openvino_model"
-  conf: 0.35
+  # Model .pt/.onnx sẽ tự export sang OpenVINO; thư mục OpenVINO có sẵn được dùng trực tiếp.
+  weights: "resources/models/yolov8s_openvino_model"
+  conf: 0.25
   iou: 0.45
-  imgsz: 320         # 320x320 tối ưu CPU cực tốt (~25-30 FPS/luồng)
-  skip_frames: 1     # Infer AI 1 frame rồi giữ box frame tiếp theo -> giảm 50% CPU mà hình ảnh vẫn mượt
-  target_fps: 15     # Giới hạn xử lý tối đa mỗi camera (đáp ứng tiêu chí >= 10 FPS, trễ < 1s)
+  imgsz: 480
+  skip_frames: 0     # Infer trên mọi frame pipeline xử lý để giảm bỏ lỡ vật thể qua vạch.
+  target_fps: 12     # FPS tối đa; FPS thực tế phụ thuộc hiệu năng CPU và được ghi log.
+  metrics_log_interval_seconds: 10
   classes:
     - 0  # person
     - 1  # bicycle
@@ -24,6 +25,7 @@ database:
   snapshot_dir: "resources/database/snapshots"
 
 cameras:
+  # ROI sơ bộ theo frame mẫu 1920x1080; từng camera có tọa độ riêng để dễ hiệu chỉnh.
   - id: "cam_1"
     name: "Camera 1 - Front Gate"
     source: "resources/videos/C001.mp4"
@@ -31,15 +33,15 @@ cameras:
     enabled: true
     line_crossing:
       enabled: true
-      point1: [420, 750]
-      point2: [1950, 750]
+      point1: [500, 760]
+      point2: [1770, 760]
     restricted_zone:
       enabled: true
       polygon:
-        - [420, 650]
-        - [1950, 650]
-        - [1950, 850]
-        - [420, 850]
+        - [560, 650]
+        - [1740, 650]
+        - [1870, 860]
+        - [470, 860]
 
 
   - id: "cam_2"
@@ -49,15 +51,15 @@ cameras:
     enabled: true
     line_crossing:
       enabled: true
-      point1: [420, 750]
-      point2: [1950, 750]
+      point1: [520, 740]
+      point2: [1780, 740]
     restricted_zone:
       enabled: true
       polygon:
-        - [420, 650]
-        - [1950, 650]
-        - [1950, 850]
-        - [420, 850]
+        - [600, 640]
+        - [1770, 640]
+        - [1880, 850]
+        - [490, 850]
 
   - id: "cam_3"
     name: "Camera 3 - Side Alley"
@@ -66,15 +68,15 @@ cameras:
     enabled: true
     line_crossing:
       enabled: true
-      point1: [420, 750]
-      point2: [1950, 750]
+      point1: [500, 780]
+      point2: [1790, 780]
     restricted_zone:
       enabled: true
       polygon:
-        - [420, 650]
-        - [1950, 650]
-        - [1950, 850]
-        - [420, 850]
+        - [570, 675]
+        - [1780, 675]
+        - [1900, 875]
+        - [450, 875]
 
   - id: "cam_4"
     name: "Camera 4 - Backyard"
@@ -83,12 +85,12 @@ cameras:
     enabled: true
     line_crossing:
       enabled: true
-      point1: [420, 750]
-      point2: [1950, 750]
+      point1: [510, 750]
+      point2: [1760, 750]
     restricted_zone:
       enabled: true
       polygon:
-        - [420, 650]
-        - [1950, 650]
-        - [1950, 850]
-        - [420, 850]
+        - [590, 655]
+        - [1730, 655]
+        - [1850, 855]
+        - [470, 855]

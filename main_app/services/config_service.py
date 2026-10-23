@@ -10,13 +10,14 @@ class ServerConfig(BaseModel):
 
 
 class ModelConfig(BaseModel):
-    # Đường dẫn model: hỗ trợ .pt, OpenVINO folder (resources/models/yolov8n_openvino_model) hoặc .onnx
-    weights: str = "resources/models/yolov8n_openvino_model"
+    # Model .pt/.onnx sẽ được export và chạy bằng OpenVINO trên CPU.
+    weights: str = "resources/models/yolov8s.pt"
     conf: float = Field(0.35, ge=0.0, le=1.0)
     iou: float = Field(0.45, ge=0.0, le=1.0)
-    imgsz: int = 320  # Kích thước 320 hoặc 416 tối ưu CPU, giảm 60% tải tính toán so với 640
-    skip_frames: int = 1  # Bỏ qua n frame giữa các lần infer AI (1: infer xen kẽ frame, video vẫn mượt 30fps)
-    target_fps: int = 15  # Giới hạn FPS xử lý tối đa cho mỗi camera để tránh quá tải CPU
+    imgsz: int = 480
+    skip_frames: int = Field(0, ge=0)
+    target_fps: int = Field(12, ge=1)
+    metrics_log_interval_seconds: int = Field(10, ge=1)
     classes: List[int] = Field(default_factory=lambda: [0, 1, 2, 3, 5, 7])
     device: str = "cpu"
 

@@ -1,7 +1,7 @@
 import logging
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 import cv2
 import numpy as np
 
@@ -49,12 +49,18 @@ class SingleCameraPipeline:
         self.model_config = model_config
 
         self.reader = CameraReader(config.id, config.source, config.name)
-        self.streamer = FFmpegRTSPStreamer(config.rtsp_out)
+        self.skip_frames = model_config.skip_frames
+        self.target_fps = model_config.target_fps
+        self.streamer = FFmpegRTSPStreamer(config.rtsp_out, fps=self.target_fps)
 
         self.line_counter: Optional[LineCrossingCounter] = None
         if config.line_crossing.enabled:
+            persisted_counts = db.get_counts().get(config.id, {})
             self.line_counter = LineCrossingCounter(
-                config.line_crossing.point1, config.line_crossing.point2
+                config.line_crossing.point1,
+                config.line_crossing.point2,
+                count_in=persisted_counts.get("count_in", 0),
+                count_out=persisted_counts.get("count_out", 0),
             )
 
         self.zone_detector: Optional[ZoneIntrusionDetector] = None
@@ -68,23 +74,41 @@ class SingleCameraPipeline:
         self._annotated_frame: Optional[np.ndarray] = None
         self._frame_lock = threading.Lock()
 
-        # Tối ưu suy luận AI
         self._frame_count = 0
         self._last_detections: List[Detection] = []
-        self.skip_frames = getattr(model_config, "skip_frames", 1)
-        self.target_fps = getattr(model_config, "target_fps", 15)
 
         self.output_fps: float = 0.0
         self.latency_ms: float = 0.0
+        self.inference_fps: float = 0.0
+        self.inference_latency_ms: float = 0.0
         self._fps_count = 0
-        self._fps_time = time.time()
+        self._fps_time = time.perf_counter()
+        self._metrics_started_at = self._fps_time
+        self._inference_count = 0
+        self._inference_latency_total_ms = 0.0
         self.is_running = False
 
     def start(self) -> None:
-        if self.is_running:
+        if self._thread is not None and self._thread.is_alive():
             return
         self.is_running = True
         self._stop_event.clear()
+        self._frame_count = 0
+        self._last_detections.clear()
+        self._fps_count = 0
+        self._inference_count = 0
+        self._inference_latency_total_ms = 0.0
+        self._fps_time = time.perf_counter()
+        self._metrics_started_at = self._fps_time
+        self.output_fps = 0.0
+        self.inference_fps = 0.0
+        self.latency_ms = 0.0
+        self.inference_latency_ms = 0.0
+        if self.line_counter:
+            self.line_counter.reset_tracks()
+        if self.zone_detector:
+            self.zone_detector.reset_tracks()
+        self.streamer.start()
         self.reader.start()
 
         self._thread = threading.Thread(
@@ -94,86 +118,120 @@ class SingleCameraPipeline:
         logger.info("[%s] Khởi động camera pipeline.", self.camera_id)
 
     def stop(self) -> None:
-        if not self.is_running:
+        if not self.is_running and (
+            self._thread is None or not self._thread.is_alive()
+        ):
             return
         self._stop_event.set()
         self.reader.stop()
         if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
+            self._thread.join(timeout=5.0)
+            if self._thread.is_alive():
+                logger.warning(
+                    "[%s] Pipeline thread chưa kết thúc sau 5 giây; "
+                    "sẽ không tạo thread mới cho đến khi thread hiện tại dừng.",
+                    self.camera_id,
+                )
+            else:
+                self._thread = None
         self.streamer.close()
-        self.is_running = False
-        logger.info("[%s] Dừng camera pipeline an toàn.", self.camera_id)
+        if self._thread is None:
+            self.is_running = False
+            logger.info("[%s] Dừng camera pipeline an toàn.", self.camera_id)
 
     def get_latest_annotated_frame(self) -> Optional[np.ndarray]:
         with self._frame_lock:
             return None if self._annotated_frame is None else self._annotated_frame.copy()
 
     def _process_loop(self) -> None:
-        min_frame_time = 1.0 / max(self.target_fps, 5)
+        min_frame_time = 1.0 / self.target_fps
+        try:
+            while not self._stop_event.is_set():
+                t_start = time.perf_counter()
+                raw_frame = self.reader.read_latest_frame()
 
-        while not self._stop_event.is_set():
-            t_start = time.time()
-            raw_frame = self.reader.read_latest_frame()
+                if raw_frame is None:
+                    time.sleep(0.01)
+                    continue
 
-            if raw_frame is None:
-                time.sleep(0.01)
-                continue
+                should_infer = self._frame_count % (self.skip_frames + 1) == 0
+                self._frame_count += 1
 
-            # 1. Cơ chế Skip-Frame: Chỉ chạy nhận diện nặng ở frame chu kỳ
-            should_infer = (self._frame_count % (self.skip_frames + 1) == 0)
-            self._frame_count += 1
+                if should_infer:
+                    inference_started_at = time.perf_counter()
+                    detections = self.tracker.track(raw_frame)
+                    inference_elapsed = time.perf_counter() - inference_started_at
+                    self._inference_latency_total_ms += inference_elapsed * 1000
+                    self._inference_count += 1
+                    self.inference_latency_ms = round(
+                        self._inference_latency_total_ms / self._inference_count, 1
+                    )
+                    self._last_detections = detections
+                    active_ids = {d.track_id for d in detections}
+                    self._process_events(raw_frame, detections, active_ids)
+                else:
+                    detections = self._last_detections
 
-            if should_infer:
-                # Chạy nhận diện & bám vết YOLOv8
-                detections = self.tracker.track(raw_frame)
-                self._last_detections = detections
-                active_ids = {d.track_id for d in detections}
+                annotated = self._draw(raw_frame.copy(), detections)
+                with self._frame_lock:
+                    self._annotated_frame = annotated
 
-                # Xử lý sự kiện (Đếm vạch & Vùng cấm)
-                self._process_events(raw_frame, detections, active_ids)
-            else:
-                # Dùng lại kết quả nhận diện của frame trước để vẽ
-                detections = self._last_detections
+                self.streamer.push_frame(annotated)
 
-            # 2. Vẽ kết quả lên frame mới nhất
-            annotated = self._draw(raw_frame.copy(), detections)
+                self.latency_ms = round(
+                    (time.perf_counter() - t_start) * 1000, 1
+                )
+                self._fps_count += 1
+                now = time.perf_counter()
+                fps_elapsed = now - self._fps_time
+                if fps_elapsed >= 1.0:
+                    self.output_fps = round(self._fps_count / fps_elapsed, 1)
+                    self._fps_count = 0
+                    self._fps_time = now
 
-            with self._frame_lock:
-                self._annotated_frame = annotated
+                metrics_elapsed = now - self._metrics_started_at
+                if metrics_elapsed >= self.model_config.metrics_log_interval_seconds:
+                    self.inference_fps = round(
+                        self._inference_count / metrics_elapsed, 2
+                    )
+                    logger.info(
+                        "[%s] Performance: input_fps=%.1f output_fps=%.1f "
+                        "inference_fps=%.2f inference_latency_ms=%.1f "
+                        "processing_latency_ms=%.1f",
+                        self.camera_id,
+                        self.reader.fps,
+                        self.output_fps,
+                        self.inference_fps,
+                        self.inference_latency_ms,
+                        self.latency_ms,
+                    )
+                    self._inference_count = 0
+                    self._inference_latency_total_ms = 0.0
+                    self._metrics_started_at = now
 
-            # 3. Đẩy ra RTSP qua FFmpeg (F08)
-            self.streamer.push_frame(annotated)
-
-            # 4. Đo đạc hiệu năng
-            self.latency_ms = round((time.time() - t_start) * 1000, 1)
-            self._fps_count += 1
-            now = time.time()
-            if now - self._fps_time >= 1.0:
-                self.output_fps = round(self._fps_count / (now - self._fps_time), 1)
-                self._fps_count = 0
-                self._fps_time = now
-
-            # 5. Điều tiết FPS để không chiếm dụng 100% CPU
-            elapsed = time.time() - t_start
-            if elapsed < min_frame_time:
-                time.sleep(min_frame_time - elapsed)
+                elapsed = time.perf_counter() - t_start
+                if elapsed < min_frame_time:
+                    time.sleep(min_frame_time - elapsed)
+        finally:
+            self.is_running = False
 
     def _process_events(
-        self, frame: np.ndarray, detections: List[Detection], active_ids: set
+        self, frame: np.ndarray, detections: List[Detection], active_ids: Set[int]
     ) -> None:
         for det in detections:
             # Đếm cắt vạch
             if self.line_counter:
                 direction = self.line_counter.update(det.track_id, det.bottom_center)
                 if direction:
-                    self.db.save_event(
+                    _, count_in, count_out = self.db.save_line_crossing(
                         camera_id=self.camera_id,
                         track_id=det.track_id,
-                        event_type="line_crossing",
+                        direction=direction,
                         details=f"Direction: {direction}, Class: {det.class_name}",
                         frame=frame,
                     )
+                    self.line_counter.count_in = count_in
+                    self.line_counter.count_out = count_out
 
             # Xâm nhập vùng cấm
             if self.zone_detector:
@@ -223,6 +281,8 @@ class SingleCameraPipeline:
         return frame
 
     def get_status(self) -> dict:
+        count_in = self.line_counter.count_in if self.line_counter else 0
+        count_out = self.line_counter.count_out if self.line_counter else 0
         return {
             "id": self.camera_id,
             "name": self.name,
@@ -230,7 +290,11 @@ class SingleCameraPipeline:
             "state": self.reader.state,
             "input_fps": self.reader.fps,
             "output_fps": self.output_fps,
+            "inference_fps": self.inference_fps,
+            "inference_latency_ms": self.inference_latency_ms,
             "latency_ms": self.latency_ms,
+            "count_in": count_in,
+            "count_out": count_out,
             "reconnect_count": self.reader.reconnect_count,
             "rtsp_out": self.config.rtsp_out,
         }
@@ -247,6 +311,7 @@ class CameraController:
 
         # Mỗi camera khởi tạo một instance YoloTracker riêng biệt để độc lập trạng thái bám vết (F04)
         for c_cfg in config.cameras:
+            self.db.ensure_camera(c_cfg.id)
             tracker = YoloTracker(
                 weights=config.model.weights,
                 conf=config.model.conf,

@@ -1,4 +1,5 @@
 import pytest
+import main_app.services.analytics_service as analytics_service
 from main_app.services.analytics_service import (
     LineCrossingCounter,
     ZoneIntrusionDetector,
@@ -19,6 +20,9 @@ def test_segments_intersect():
     # Không cắt nhau
     q5, q6 = (15.0, 0.0), (15.0, 10.0)
     assert segments_intersect(p1, p2, q5, q6) is False
+
+    # Chạm đầu mút và cắt tại đầu cuối của vạch vẫn được tính là giao nhau.
+    assert segments_intersect((0.0, 5.0), (10.0, 5.0), (10.0, 5.0), (10.0, 9.0))
 
 
 def test_line_crossing_counter():
@@ -48,6 +52,45 @@ def test_line_crossing_counter():
     assert counter.count_out == 1
 
 
+def test_line_counter_counts_crossing_after_short_track_miss(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(analytics_service.time, "monotonic", lambda: clock[0])
+    counter = LineCrossingCounter(
+        (0, 10), (10, 10), max_missing_seconds=2.0
+    )
+    assert counter.update(1, (5.0, 0.0)) is None
+    clock[0] = 1.0
+    counter.clean_old_tracks(set())
+    clock[0] = 1.8
+
+    assert counter.update(1, (5.0, 20.0)) == "in"
+    assert counter.count_in == 1
+
+
+def test_line_counter_expires_stale_track_by_elapsed_time(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(analytics_service.time, "monotonic", lambda: clock[0])
+    counter = LineCrossingCounter(
+        (0, 10), (10, 10), max_missing_seconds=2.0
+    )
+    counter.update(1, (5.0, 0.0))
+
+    clock[0] = 2.1
+    counter.clean_old_tracks(set())
+    clock[0] = 2.2
+
+    assert counter.update(1, (5.0, 20.0)) is None
+    assert counter.count_in == 0
+
+
+def test_line_counter_counts_when_track_lands_on_line_first():
+    counter = LineCrossingCounter((0, 10), (10, 10))
+    counter.update(1, (5.0, 0.0))
+
+    assert counter.update(1, (5.0, 10.0)) is None
+    assert counter.update(1, (5.0, 20.0)) == "in"
+
+
 def test_zone_intrusion_detector():
     polygon = [(10, 10), (100, 10), (100, 100), (10, 100)]
     detector = ZoneIntrusionDetector(polygon)
@@ -68,3 +111,17 @@ def test_zone_intrusion_detector():
 
     # 5. Bước vào lại -> Được tính là lần vi phạm mới (True)
     assert detector.update(track_id=1, point=(50.0, 50.0)) is True
+
+
+def test_zone_intrusion_does_not_repeat_after_short_track_miss(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(analytics_service.time, "monotonic", lambda: clock[0])
+    detector = ZoneIntrusionDetector(
+        [(10, 10), (100, 10), (100, 100), (10, 100)],
+        max_missing_seconds=2.0,
+    )
+    assert detector.update(1, (50.0, 50.0)) is True
+    clock[0] = 1.0
+    detector.clean_old_tracks(set())
+    clock[0] = 1.8
+    assert detector.update(1, (60.0, 60.0)) is False

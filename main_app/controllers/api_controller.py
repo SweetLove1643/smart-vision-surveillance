@@ -40,6 +40,11 @@ def create_api_app(controller: CameraController) -> FastAPI:
         """Xem trạng thái, FPS và số liệu chi tiết của từng camera (F10)."""
         return controller.get_all_status()
 
+    @app.get("/counts", tags=["Thống kê"])
+    def get_counts():
+        """Trả tổng lượt cắt vạch đã lưu bền vững theo camera."""
+        return controller.db.get_counts()
+
     @app.post("/cameras/{camera_id}/start", tags=["Quản lý Camera"])
     def start_camera(camera_id: str):
         """Bật một camera khi hệ thống đang chạy (F10)."""

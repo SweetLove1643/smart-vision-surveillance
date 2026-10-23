@@ -64,13 +64,35 @@ multi_camera_process_system/
 │
 ├── resources/
 │   ├── database/                  # SQLite database (events.db) & violation snapshots
-│   ├── models/                    # YOLO model weights (yolov8n.pt)
+│   ├── models/                    # YOLO source weights and OpenVINO exports
 │   └── videos/                    # Sample test video feeds (.gitkeep preserved)
 │
 ├── logs/                          # Centralized runtime application logs (app.log)
 └── tests/
     └── test_analytics.py          # Pytest unit tests for line counter & zone intrusion
 ```
+
+---
+
+## Model, performance, and counting
+
+- `model.weights` may point to an OpenVINO model directory or a `.pt`/`.onnx` source.
+  Source models are exported to OpenVINO FP16 at startup and then used on CPU. A
+  matching `<model>_openvino_model` export is reused when its input size matches
+  `model.imgsz`. If export fails, a warning is logged before PyTorch CPU fallback.
+- Per-camera `input_fps`, `output_fps`, `inference_fps`, average inference latency, and
+  processing latency are logged every `model.metrics_log_interval_seconds` to
+  `logs/app.log`. `target_fps` is a maximum, not a guaranteed throughput.
+- RTSP uses wall-clock frame timestamps and passthrough frame pacing so slow CPU
+  inference does not make the stream play faster than the processed video.
+- Frame skipping defaults to zero so tracking and line/zone analytics run on each
+  processed frame. Missing tracks are retained for up to two seconds to bridge
+  short detection gaps. Line-crossing totals are stored per camera in SQLite and
+  survive restarts.
+- Line and restricted-zone coordinates are configured separately for each camera
+  in `config.yaml` and use source-frame pixel coordinates (the included clips are
+  1920x1080). The current polygons are provisional overlays approved for initial
+  testing; review them against installed camera views before relying on alerts.
 
 ---
 
@@ -119,6 +141,7 @@ This starts the backend API service and simultaneously opens the desktop monitor
 
 - `GET /health` : Health check and camera count.
 - `GET /cameras` : Live status, FPS, latency, and reconnect count for all cameras.
+- `GET /counts` : Persisted line-crossing totals by camera.
 - `POST /cameras/{camera_id}/start` : Start a camera pipeline dynamically.
 - `POST /cameras/{camera_id}/stop` : Stop a camera pipeline dynamically.
 - `GET /events` : Query violation events (filters: `camera_id`, `start_time`, `end_time`, `limit`).

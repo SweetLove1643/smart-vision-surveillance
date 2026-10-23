@@ -26,6 +26,8 @@ class FFmpegRTSPStreamer:
 
     def __init__(self, rtsp_url: str, fps: int = 25, enabled: bool = True) -> None:
         self.rtsp_url = rtsp_url
+        if fps < 1:
+            raise ValueError("FPS của RTSP streamer phải lớn hơn 0.")
         self.fps = fps
         self.enabled = enabled
         self._ffmpeg_available = shutil.which("ffmpeg") is not None
@@ -41,11 +43,18 @@ class FFmpegRTSPStreamer:
         if not self._ffmpeg_available:
             logger.warning("Không tìm thấy 'ffmpeg' trong PATH. Chức năng RTSP tạm thời tắt.")
 
-        if self.enabled and self._ffmpeg_available:
-            self._thread = threading.Thread(
-                target=self._worker_loop, name=f"streamer-{self._port}", daemon=True
-            )
-            self._thread.start()
+        self.start()
+
+    def start(self) -> None:
+        if not self.enabled or not self._ffmpeg_available:
+            return
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._worker_loop, name=f"streamer-{self._port}", daemon=True
+        )
+        self._thread.start()
 
     def _parse_host_port(self, url: str) -> tuple[str, int]:
         try:
@@ -90,12 +99,14 @@ class FFmpegRTSPStreamer:
             "-vcodec", "rawvideo",
             "-pix_fmt", "bgr24",
             "-s", f"{width}x{height}",
-            "-r", str(self.fps),
+            "-framerate", str(self.fps),
+            "-use_wallclock_as_timestamps", "1",
             "-i", "-",
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
             "-preset", "ultrafast",
             "-tune", "zerolatency",
+            "-fps_mode", "passthrough",
             "-f", "rtsp",
             "-rtsp_transport", "tcp",
             self.rtsp_url,
@@ -179,6 +190,9 @@ class FFmpegRTSPStreamer:
     def close(self) -> None:
         self._stop_event.set()
         if self._thread is not None:
-            self._thread.join(timeout=1.0)
-            self._thread = None
+            self._thread.join(timeout=3.0)
+            if self._thread.is_alive():
+                logger.warning("FFmpeg streamer thread chưa dừng sau 3 giây.")
+            else:
+                self._thread = None
         self.close_process()

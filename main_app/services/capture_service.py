@@ -48,6 +48,9 @@ class CameraReader:
         if self._thread is not None and self._thread.is_alive():
             return self
         self._stop_event.clear()
+        with self._lock:
+            self._frame = None
+        self.state = CONNECTING
         self._thread = threading.Thread(
             target=self._run_loop, name=f"capture-{self.camera_id}", daemon=True
         )
@@ -58,8 +61,13 @@ class CameraReader:
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
-            self._thread = None
-        self.state = STOPPED
+            if self._thread.is_alive():
+                logger.warning(
+                    "[%s] Capture thread chưa dừng sau 2 giây.", self.camera_id
+                )
+            else:
+                self._thread = None
+                self.state = STOPPED
 
     def read_latest_frame(self) -> Optional[np.ndarray]:
         """Lấy frame mới nhất, không bao giờ bị nghẽn queue (F02)."""
