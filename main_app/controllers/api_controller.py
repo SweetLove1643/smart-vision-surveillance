@@ -33,7 +33,19 @@ def create_api_app(controller: CameraController) -> FastAPI:
 
     @app.get("/health", tags=["Hệ thống"])
     def health_check():
-        return {"status": "ok", "total_cameras": len(controller.pipelines)}
+        inference = controller.get_inference_status()
+        return {
+            "status": "ok",
+            "total_cameras": len(controller.pipelines),
+            "inference_worker_running": inference["worker_running"],
+            "inference_api_running": inference["api_running"],
+            "inference_api_url": inference["api_url"],
+        }
+
+    @app.get("/inference", tags=["Hệ thống"])
+    def get_inference_status():
+        """Trạng thái model YOLO dùng chung và hàng đợi inference."""
+        return controller.get_inference_status()
 
     @app.get("/cameras", tags=["Quản lý Camera"])
     def get_cameras():
@@ -78,6 +90,11 @@ def create_api_app(controller: CameraController) -> FastAPI:
     @app.get("/cameras/{camera_id}/live", tags=["Xem Trực Tiếp"])
     def stream_live_mjpeg(camera_id: str):
         """Xem trực tiếp luồng video trên trình duyệt Web (Chrome/Edge) qua giao thức MJPEG."""
+        if not controller.enable_rtsp:
+            raise HTTPException(
+                status_code=503,
+                detail="RTSP output is disabled; restart without --no-rtsp to enable live feeds.",
+            )
         if camera_id not in controller.pipelines:
             raise HTTPException(status_code=404, detail=f"Không tìm thấy camera: {camera_id}")
 

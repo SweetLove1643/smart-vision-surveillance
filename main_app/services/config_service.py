@@ -18,8 +18,11 @@ class ModelConfig(BaseModel):
     skip_frames: int = Field(0, ge=0)
     target_fps: int = Field(12, ge=1)
     metrics_log_interval_seconds: int = Field(10, ge=1)
+    inference_timeout_seconds: int = Field(120, ge=1)
     classes: List[int] = Field(default_factory=lambda: [0, 1, 2, 3, 5, 7])
     device: str = "cpu"
+    inference_api_host: str = "127.0.0.1"
+    inference_api_port: int = Field(8001, ge=1, le=65535)
 
 
 class DatabaseConfig(BaseModel):

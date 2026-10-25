@@ -1,6 +1,7 @@
 import math
 import sys
 import logging
+import time
 from typing import Optional
 import cv2
 
@@ -138,6 +139,7 @@ class MainWindow(QMainWindow):
             self.controller = CameraController(config)
 
         self.views: list[CameraView] = []
+        self._last_table_refresh = 0.0
         self.timer = QTimer(self)
         self.timer.setInterval(FRAME_INTERVAL_MS)
         self.timer.timeout.connect(self._update_frames)
@@ -157,6 +159,10 @@ class MainWindow(QMainWindow):
 
         self._build_menu_bar()
         self._rebuild_grid()
+        if any(pipe.is_running for pipe in self.controller.pipelines.values()):
+            self.btn_start.setEnabled(False)
+            self.btn_stop.setEnabled(True)
+            self.timer.start()
 
     def _build_left_panel(self) -> QWidget:
         panel = QWidget()
@@ -253,7 +259,7 @@ class MainWindow(QMainWindow):
             if i < len(self.controller.camera_order):
                 cam_id = self.controller.camera_order[i]
                 pipe = self.controller.pipelines[cam_id]
-                view = CameraView(pipe.name, str(pipe.config.source))
+                view = CameraView(pipe.name, pipe.config.rtsp_out)
             else:
                 view = CameraView(f"CAM {i + 1}", "N/A")
 
@@ -313,9 +319,10 @@ class MainWindow(QMainWindow):
             if frame is not None:
                 view.show_frame(frame)
 
-        # Cập nhật số liệu mỗi giây
-        if self.timer.isActive() and (self.timer.remainingTime() < 40):
+        now = time.monotonic()
+        if self.timer.isActive() and now - self._last_table_refresh >= 1.0:
             self._refresh_tables()
+            self._last_table_refresh = now
 
 
 def run_ui():

@@ -9,18 +9,22 @@ from main_app.services import (
     AppConfig,
     CameraConfig,
     CameraReader,
+    CameraTracker,
     Detection,
     EventDatabase,
     FFmpegRTSPStreamer,
     LineCrossingCounter,
-    YoloTracker,
+    YoloInferenceService,
     ZoneIntrusionDetector,
-    LIVE,
     STOPPED,
-    CONNECTING,
-    RECONNECTING,
 )
 from main_app.services.config_service import ModelConfig
+from main_app.services.detector_service import (
+    InferenceQueueFullError,
+    InferenceUnavailableError,
+)
+from main_app.services.inference_api import YoloInferenceAPIServer
+from main_app.services.inference_client import YoloInferenceClient
 
 logger = logging.getLogger("controllers.camera")
 
@@ -29,29 +33,38 @@ class SingleCameraPipeline:
     """Pipeline xử lý độc lập cho từng camera: Capture -> AI -> Logic -> RTSP.
     
     Tối ưu hiệu năng:
-    - Mỗi camera sở hữu riêng một instance YoloTracker (tránh xung đột dữ liệu bám vết ByteTrack).
+    - Dùng chung inference service; mỗi camera có ByteTrack state riêng.
     - Hỗ trợ skip_frames: suy luận AI xen kẽ frame và giữ lại box cho frame sau -> video mượt mà không quá tải CPU.
-    - Điều tiết tốc độ khung hình (target_fps) để duy trì chuẩn >= 10 FPS và độ trễ < 1 giây.
+    - Điều tiết đầu ra không vượt quá target_fps; thông lượng thực tế phụ thuộc model và CPU.
     """
 
     def __init__(
         self,
         config: CameraConfig,
-        tracker: YoloTracker,
+        inference_client: YoloInferenceClient,
         db: EventDatabase,
         model_config: ModelConfig,
+        enable_rtsp: bool = True,
     ) -> None:
         self.config = config
         self.camera_id = config.id
         self.name = config.name
-        self.tracker = tracker
+        self.inference_client = inference_client
+        self.tracker = CameraTracker()
         self.db = db
         self.model_config = model_config
 
         self.reader = CameraReader(config.id, config.source, config.name)
+        self.output_reader = (
+            CameraReader(config.id, config.rtsp_out, f"{config.name} RTSP output")
+            if enable_rtsp
+            else None
+        )
         self.skip_frames = model_config.skip_frames
         self.target_fps = model_config.target_fps
-        self.streamer = FFmpegRTSPStreamer(config.rtsp_out, fps=self.target_fps)
+        self.streamer = FFmpegRTSPStreamer(
+            config.rtsp_out, fps=self.target_fps, enabled=enable_rtsp
+        )
 
         self.line_counter: Optional[LineCrossingCounter] = None
         if config.line_crossing.enabled:
@@ -68,11 +81,12 @@ class SingleCameraPipeline:
             self.zone_detector = ZoneIntrusionDetector(config.restricted_zone.polygon)
 
         self._thread: Optional[threading.Thread] = None
+        self._inference_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
-
-        # Lưu frame đã vẽ gần nhất để UI Qt hoặc API lấy xem
-        self._annotated_frame: Optional[np.ndarray] = None
-        self._frame_lock = threading.Lock()
+        self._inference_wakeup = threading.Event()
+        self._inference_frame_lock = threading.Lock()
+        self._latest_inference_frame: Optional[np.ndarray] = None
+        self._detections_lock = threading.Lock()
 
         self._frame_count = 0
         self._last_detections: List[Detection] = []
@@ -87,61 +101,111 @@ class SingleCameraPipeline:
         self._inference_count = 0
         self._inference_latency_total_ms = 0.0
         self.is_running = False
+        self._lifecycle_lock = threading.Lock()
 
     def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self.is_running = True
-        self._stop_event.clear()
-        self._frame_count = 0
-        self._last_detections.clear()
-        self._fps_count = 0
-        self._inference_count = 0
-        self._inference_latency_total_ms = 0.0
-        self._fps_time = time.perf_counter()
-        self._metrics_started_at = self._fps_time
-        self.output_fps = 0.0
-        self.inference_fps = 0.0
-        self.latency_ms = 0.0
-        self.inference_latency_ms = 0.0
-        if self.line_counter:
-            self.line_counter.reset_tracks()
-        if self.zone_detector:
-            self.zone_detector.reset_tracks()
-        self.streamer.start()
-        self.reader.start()
-
-        self._thread = threading.Thread(
-            target=self._process_loop, name=f"pipe-{self.camera_id}", daemon=True
-        )
-        self._thread.start()
+        with self._lifecycle_lock:
+            thread = self._thread
+            inference_thread = self._inference_thread
+            output_alive = thread is not None and thread.is_alive()
+            inference_alive = (
+                inference_thread is not None and inference_thread.is_alive()
+            )
+            if output_alive or inference_alive:
+                if self._stop_event.is_set() or not (
+                    output_alive and inference_alive
+                ):
+                    raise RuntimeError(
+                        f"Camera pipeline {self.camera_id} still has a worker running."
+                    )
+                return
+            self._stop_event.clear()
+            self._inference_wakeup.clear()
+            with self._inference_frame_lock:
+                self._latest_inference_frame = None
+            self._frame_count = 0
+            self._last_detections.clear()
+            self._fps_count = 0
+            self._inference_count = 0
+            self._inference_latency_total_ms = 0.0
+            self._fps_time = time.perf_counter()
+            self._metrics_started_at = self._fps_time
+            self.output_fps = 0.0
+            self.inference_fps = 0.0
+            self.latency_ms = 0.0
+            self.inference_latency_ms = 0.0
+            if self.line_counter:
+                self.line_counter.reset_tracks()
+            if self.zone_detector:
+                self.zone_detector.reset_tracks()
+            self.streamer.start()
+            self.reader.start()
+            if self.output_reader:
+                self.output_reader.start()
+            self.is_running = True
+            self._inference_thread = threading.Thread(
+                target=self._inference_loop,
+                name=f"infer-{self.camera_id}",
+                daemon=True,
+            )
+            self._inference_thread.start()
+            self._thread = threading.Thread(
+                target=self._process_loop, name=f"pipe-{self.camera_id}", daemon=True
+            )
+            self._thread.start()
         logger.info("[%s] Khởi động camera pipeline.", self.camera_id)
 
     def stop(self) -> None:
-        if not self.is_running and (
-            self._thread is None or not self._thread.is_alive()
-        ):
-            return
-        self._stop_event.set()
-        self.reader.stop()
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-            if self._thread.is_alive():
-                logger.warning(
-                    "[%s] Pipeline thread chưa kết thúc sau 5 giây; "
-                    "sẽ không tạo thread mới cho đến khi thread hiện tại dừng.",
-                    self.camera_id,
-                )
-            else:
+        self.request_stop()
+        with self._lifecycle_lock:
+            thread = self._thread
+            inference_thread = self._inference_thread
+            if (
+                (thread is None or not thread.is_alive())
+                and (inference_thread is None or not inference_thread.is_alive())
+            ):
                 self._thread = None
-        self.streamer.close()
-        if self._thread is None:
-            self.is_running = False
+                self._inference_thread = None
+                self.is_running = False
+                return
+        self.reader.stop()
+        if self.output_reader:
+            self.output_reader.stop()
+        for worker in (thread, inference_thread):
+            if worker is None or worker is threading.current_thread():
+                continue
+            worker.join(timeout=15.0)
+            if worker.is_alive():
+                logger.warning(
+                    "[%s] Thread %s chưa kết thúc sau 15 giây; "
+                    "sẽ không tạo lại pipeline cho đến khi thread hiện tại dừng.",
+                    self.camera_id,
+                    worker.name,
+                )
+        with self._lifecycle_lock:
+            if thread is not None and not thread.is_alive() and self._thread is thread:
+                self._thread = None
+            if (
+                inference_thread is not None
+                and not inference_thread.is_alive()
+                and self._inference_thread is inference_thread
+            ):
+                self._inference_thread = None
+            if self._thread is None and self._inference_thread is None:
+                self.is_running = False
+        if not self.is_running:
             logger.info("[%s] Dừng camera pipeline an toàn.", self.camera_id)
 
+    def request_stop(self) -> None:
+        self._stop_event.set()
+        self._inference_wakeup.set()
+
     def get_latest_annotated_frame(self) -> Optional[np.ndarray]:
-        with self._frame_lock:
-            return None if self._annotated_frame is None else self._annotated_frame.copy()
+        return (
+            self.output_reader.read_latest_frame()
+            if self.output_reader is not None
+            else None
+        )
 
     def _process_loop(self) -> None:
         min_frame_time = 1.0 / self.target_fps
@@ -158,24 +222,14 @@ class SingleCameraPipeline:
                 self._frame_count += 1
 
                 if should_infer:
-                    inference_started_at = time.perf_counter()
-                    detections = self.tracker.track(raw_frame)
-                    inference_elapsed = time.perf_counter() - inference_started_at
-                    self._inference_latency_total_ms += inference_elapsed * 1000
-                    self._inference_count += 1
-                    self.inference_latency_ms = round(
-                        self._inference_latency_total_ms / self._inference_count, 1
-                    )
-                    self._last_detections = detections
-                    active_ids = {d.track_id for d in detections}
-                    self._process_events(raw_frame, detections, active_ids)
-                else:
-                    detections = self._last_detections
+                    with self._inference_frame_lock:
+                        self._latest_inference_frame = raw_frame
+                    self._inference_wakeup.set()
+
+                with self._detections_lock:
+                    detections = list(self._last_detections)
 
                 annotated = self._draw(raw_frame.copy(), detections)
-                with self._frame_lock:
-                    self._annotated_frame = annotated
-
                 self.streamer.push_frame(annotated)
 
                 self.latency_ms = round(
@@ -189,31 +243,93 @@ class SingleCameraPipeline:
                     self._fps_count = 0
                     self._fps_time = now
 
-                metrics_elapsed = now - self._metrics_started_at
-                if metrics_elapsed >= self.model_config.metrics_log_interval_seconds:
-                    self.inference_fps = round(
-                        self._inference_count / metrics_elapsed, 2
-                    )
-                    logger.info(
-                        "[%s] Performance: input_fps=%.1f output_fps=%.1f "
-                        "inference_fps=%.2f inference_latency_ms=%.1f "
-                        "processing_latency_ms=%.1f",
-                        self.camera_id,
-                        self.reader.fps,
-                        self.output_fps,
-                        self.inference_fps,
-                        self.inference_latency_ms,
-                        self.latency_ms,
-                    )
-                    self._inference_count = 0
-                    self._inference_latency_total_ms = 0.0
-                    self._metrics_started_at = now
-
                 elapsed = time.perf_counter() - t_start
                 if elapsed < min_frame_time:
-                    time.sleep(min_frame_time - elapsed)
+                    self._stop_event.wait(min_frame_time - elapsed)
+        except Exception:
+            logger.exception(
+                "[%s] Pipeline bị dừng do lỗi không được xử lý.", self.camera_id
+            )
         finally:
-            self.is_running = False
+            self._stop_event.set()
+            self._inference_wakeup.set()
+            self.reader.stop()
+            if self.output_reader:
+                self.output_reader.stop()
+            self.streamer.close()
+            with self._lifecycle_lock:
+                self.is_running = False
+
+    def _inference_loop(self) -> None:
+        while not self._stop_event.is_set():
+            self._inference_wakeup.wait()
+            self._inference_wakeup.clear()
+            if self._stop_event.is_set():
+                return
+            with self._inference_frame_lock:
+                frame = self._latest_inference_frame
+                self._latest_inference_frame = None
+            if frame is None:
+                continue
+
+            inference_started_at = time.perf_counter()
+            try:
+                raw_detections = self.inference_client.infer(frame)
+            except (InferenceQueueFullError, InferenceUnavailableError, TimeoutError) as exc:
+                logger.warning(
+                    "[%s] Bỏ frame inference do API bận hoặc chưa sẵn sàng: %s",
+                    self.camera_id,
+                    exc,
+                )
+                continue
+            except Exception:
+                logger.exception(
+                    "[%s] Inference/tracking lỗi; bỏ detections của frame này.",
+                    self.camera_id,
+                )
+                continue
+
+            if self._stop_event.is_set():
+                return
+            detections = self.tracker.track(raw_detections, frame.shape)
+
+            inference_elapsed = time.perf_counter() - inference_started_at
+            self._inference_latency_total_ms += inference_elapsed * 1000
+            self._inference_count += 1
+            self.inference_latency_ms = round(
+                self._inference_latency_total_ms / self._inference_count, 1
+            )
+            with self._detections_lock:
+                self._last_detections = detections
+            active_ids = {d.track_id for d in detections}
+            try:
+                self._process_events(frame, detections, active_ids)
+            except Exception:
+                logger.exception(
+                    "[%s] Event analytics failed for the inferred frame.",
+                    self.camera_id,
+                )
+
+            now = time.perf_counter()
+            metrics_elapsed = now - self._metrics_started_at
+            if metrics_elapsed >= self.model_config.metrics_log_interval_seconds:
+                self.inference_fps = round(
+                    self._inference_count / metrics_elapsed, 2
+                )
+                logger.info(
+                    "[%s] Performance: input_fps=%.1f output_fps=%.1f "
+                    "inference_fps=%.2f inference_latency_ms=%.1f "
+                    "processing_latency_ms=%.1f",
+                    self.camera_id,
+                    self.reader.fps,
+                    self.output_fps,
+                    self.inference_fps,
+                    self.inference_latency_ms,
+                    self.latency_ms,
+                )
+                self._inference_count = 0
+                self._inference_latency_total_ms = 0.0
+                self._metrics_started_at = now
 
     def _process_events(
         self, frame: np.ndarray, detections: List[Detection], active_ids: Set[int]
@@ -288,6 +404,10 @@ class SingleCameraPipeline:
             "name": self.name,
             "enabled": self.is_running,
             "state": self.reader.state,
+            "rtsp_state": (
+                self.output_reader.state if self.output_reader else STOPPED
+            ),
+            "rtsp_enabled": self.output_reader is not None,
             "input_fps": self.reader.fps,
             "output_fps": self.output_fps,
             "inference_fps": self.inference_fps,
@@ -303,51 +423,145 @@ class SingleCameraPipeline:
 class CameraController:
     """Bộ điều khiển quản lý toàn bộ các Camera Pipelines cho cả UI Qt và FastAPI."""
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, enable_rtsp: bool = True) -> None:
         self.config = config
+        self.enable_rtsp = enable_rtsp
+        self._inference_shutdown_timeout = (
+            config.model.inference_timeout_seconds + 10
+        )
         self.db = EventDatabase(config.database.path, config.database.snapshot_dir)
         self.pipelines: Dict[str, SingleCameraPipeline] = {}
         self.camera_order: List[str] = []
+        self._lifecycle_lock = threading.RLock()
+        self._stopping = False
 
-        # Mỗi camera khởi tạo một instance YoloTracker riêng biệt để độc lập trạng thái bám vết (F04)
+        self.inference_service = YoloInferenceService(
+            weights=config.model.weights,
+            conf=config.model.conf,
+            iou=config.model.iou,
+            imgsz=config.model.imgsz,
+            classes=config.model.classes,
+            device=config.model.device,
+            queue_size=max(1, len(config.cameras)),
+            request_timeout_seconds=config.model.inference_timeout_seconds,
+        )
+        self.inference_api = YoloInferenceAPIServer(
+            self.inference_service,
+            config.model.inference_api_host,
+            config.model.inference_api_port,
+        )
+        inference_url = (
+            f"http://{config.model.inference_api_host}:"
+            f"{config.model.inference_api_port}"
+        )
+
         for c_cfg in config.cameras:
             self.db.ensure_camera(c_cfg.id)
-            tracker = YoloTracker(
-                weights=config.model.weights,
-                conf=config.model.conf,
-                iou=config.model.iou,
-                imgsz=config.model.imgsz,
-                classes=config.model.classes,
-                device=config.model.device,
+            self.pipelines[c_cfg.id] = SingleCameraPipeline(
+                c_cfg,
+                YoloInferenceClient(
+                    inference_url,
+                    c_cfg.id,
+                    timeout_seconds=config.model.inference_timeout_seconds + 5,
+                ),
+                self.db,
+                config.model,
+                enable_rtsp=enable_rtsp,
             )
-            self.pipelines[c_cfg.id] = SingleCameraPipeline(c_cfg, tracker, self.db, config.model)
             self.camera_order.append(c_cfg.id)
 
-    def start_all(self) -> None:
-        for pipe in self.pipelines.values():
-            if pipe.config.enabled:
-                pipe.start()
+    def start_all(self, camera_ids: Optional[List[str]] = None) -> None:
+        with self._lifecycle_lock:
+            selected_ids = set(camera_ids) if camera_ids is not None else None
+            unknown_ids = (
+                selected_ids.difference(self.pipelines)
+                if selected_ids is not None
+                else set()
+            )
+            if unknown_ids:
+                raise ValueError(
+                    "Không tìm thấy camera được chọn: "
+                    + ", ".join(sorted(unknown_ids))
+                )
+            disabled_ids = (
+                {
+                    camera_id
+                    for camera_id in selected_ids
+                    if not self.pipelines[camera_id].config.enabled
+                }
+                if selected_ids is not None
+                else set()
+            )
+            if disabled_ids:
+                raise ValueError(
+                    "Camera được chọn đang bị tắt trong cấu hình: "
+                    + ", ".join(sorted(disabled_ids))
+                )
+            self.inference_api.start()
+            try:
+                for camera_id, pipe in self.pipelines.items():
+                    if pipe.config.enabled and (
+                        selected_ids is None or camera_id in selected_ids
+                    ):
+                        pipe.start()
+            except Exception:
+                logger.exception("Camera startup failed; stopping started pipelines.")
+                for pipe in self.pipelines.values():
+                    pipe.request_stop()
+                for pipe in self.pipelines.values():
+                    pipe.stop()
+                self.inference_api.stop(timeout=self._inference_shutdown_timeout)
+                raise
 
     def stop_all(self) -> None:
-        for pipe in self.pipelines.values():
-            pipe.stop()
+        with self._lifecycle_lock:
+            if self._stopping:
+                return
+            self._stopping = True
+            try:
+                for pipe in self.pipelines.values():
+                    pipe.request_stop()
+                for pipe in self.pipelines.values():
+                    pipe.stop()
+                self.inference_api.stop(timeout=self._inference_shutdown_timeout)
+            finally:
+                self._stopping = False
 
     def start_camera(self, camera_id: str) -> bool:
         pipe = self.pipelines.get(camera_id)
         if pipe:
-            pipe.start()
+            with self._lifecycle_lock:
+                self.inference_api.start()
+                pipe.start()
             return True
         return False
 
     def stop_camera(self, camera_id: str) -> bool:
         pipe = self.pipelines.get(camera_id)
         if pipe:
-            pipe.stop()
+            with self._lifecycle_lock:
+                pipe.stop()
+                if not any(
+                    running_pipe.is_running
+                    for running_pipe in self.pipelines.values()
+                ):
+                    self.inference_api.stop(
+                        timeout=self._inference_shutdown_timeout
+                    )
             return True
         return False
 
     def get_all_status(self) -> List[dict]:
         return [self.pipelines[cid].get_status() for cid in self.camera_order]
+
+    def get_inference_status(self) -> dict:
+        status = self.inference_service.get_status()
+        status["api_url"] = (
+            f"http://{self.config.model.inference_api_host}:"
+            f"{self.config.model.inference_api_port}"
+        )
+        status["api_running"] = self.inference_api.is_running
+        return status
 
     def get_frame_by_id(self, camera_id: str) -> Optional[np.ndarray]:
         pipe = self.pipelines.get(camera_id)
@@ -361,7 +575,9 @@ class CameraController:
     def get_state_by_index(self, index: int) -> str:
         if 0 <= index < len(self.camera_order):
             pipe = self.pipelines[self.camera_order[index]]
-            return pipe.reader.state if pipe.is_running else STOPPED
+            if not pipe.is_running or pipe.output_reader is None:
+                return STOPPED
+            return pipe.output_reader.state
         return STOPPED
 
     def get_reconnect_count_by_index(self, index: int) -> int:

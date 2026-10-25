@@ -5,12 +5,13 @@ server:
 model:
   # Model .pt/.onnx sẽ tự export sang OpenVINO; thư mục OpenVINO có sẵn được dùng trực tiếp.
   weights: "resources/models/yolov8s_openvino_model"
-  conf: 0.25
+  conf: 0.7
   iou: 0.45
   imgsz: 480
   skip_frames: 0     # Infer trên mọi frame pipeline xử lý để giảm bỏ lỡ vật thể qua vạch.
   target_fps: 12     # FPS tối đa; FPS thực tế phụ thuộc hiệu năng CPU và được ghi log.
   metrics_log_interval_seconds: 10
+  inference_timeout_seconds: 120
   classes:
     - 0  # person
     - 1  # bicycle
@@ -19,6 +20,8 @@ model:
     - 5  # bus
     - 7  # truck
   device: "cpu"
+  inference_api_host: "127.0.0.1"
+  inference_api_port: 8001
 
 database:
   path: "resources/database/events.db"

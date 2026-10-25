@@ -1,6 +1,15 @@
 from .capture_service import CameraReader, STOPPED, CONNECTING, LIVE, RECONNECTING
 from .config_service import load_config, AppConfig, CameraConfig
-from .detector_service import YoloTracker, Detection
+from .detector_service import (
+    CameraTracker,
+    Detection,
+    InferenceQueueFullError,
+    InferenceUnavailableError,
+    RawDetection,
+    YoloInferenceService,
+)
+from .inference_api import YoloInferenceAPIServer
+from .inference_client import YoloInferenceClient
 from .analytics_service import LineCrossingCounter, ZoneIntrusionDetector
 from .storage_service import EventDatabase
 from .streamer_service import FFmpegRTSPStreamer
@@ -15,8 +24,14 @@ __all__ = [
     "load_config",
     "AppConfig",
     "CameraConfig",
-    "YoloTracker",
+    "CameraTracker",
     "Detection",
+    "InferenceQueueFullError",
+    "InferenceUnavailableError",
+    "RawDetection",
+    "YoloInferenceService",
+    "YoloInferenceAPIServer",
+    "YoloInferenceClient",
     "LineCrossingCounter",
     "ZoneIntrusionDetector",
     "EventDatabase",
